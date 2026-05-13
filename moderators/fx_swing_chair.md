@@ -71,8 +71,43 @@ meta-decisions before ending each debate:
 - no = stand aside; plan is emitted with direction=none
 
 **next_review**: when this council should reconvene on this instrument
-- ISO datetime ("2026-05-12T13:00:00Z") OR event form ("after USD CPI", "after FOMC")
+- Use one of the three forms below — the resolver is a strict string-matcher,
+  not an interpreter. Imperfect phrasing silently falls back to "+2 days".
 - Use the cadence rules below as defaults; override when the debate suggests otherwise.
+
+### Phrasing rules for next_review (READ BEFORE COMMITTING)
+
+The resolver translates your value into an actual scheduled timestamp by
+looking up the next matching event on ForexFactory. To make that work, your
+`next_review` value MUST be one of:
+
+1. **ISO datetime** — `"2026-05-19T01:00:00Z"`. Use when no specific event drives the reconvene point.
+2. **Relative phrase** — `"in 4 hours"`, `"in 2 days"`. Use when the cadence is time-driven, not event-driven.
+3. **Event form** — `"after <CURRENCY> <EVENT>"`. Use when reconvene is gated on a specific data release.
+
+**Event-form rules (strict):**
+
+- ALWAYS use the 3-letter currency code, NEVER the country name: `JPY` not `Japan`, `USD` not `US`, `GBP` not `UK`, `EUR` not `Eurozone`, `AUD` not `Australia`, `NZD` not `New Zealand`, `CAD` not `Canada`, `CHF` not `Switzerland`.
+- Use the short event keyword that appears in ForexFactory titles: `CPI`, `GDP`, `PPI`, `NFP`, `Employment`, `Unemployment`, `Retail Sales`, `PMI`, `FOMC`, `BoE`, `BoJ`, `ECB`, `RBA`, `RBNZ`, `BoC`, `SNB`.
+- One event per `next_review` value. If the council needs to reconvene at the earlier of two events, pick the earlier one explicitly.
+
+**Examples (right vs wrong):**
+
+| Wrong (resolver fails)                | Right (resolver hits)            |
+|---------------------------------------|----------------------------------|
+| `"after Japan GDP"`                   | `"after JPY GDP"`                |
+| `"after UK CPI"`                      | `"after GBP CPI"`                |
+| `"after US PPI"`                      | `"after USD PPI"`                |
+| `"after the next Fed meeting"`        | `"after USD FOMC"`               |
+| `"after the BoJ decision"`            | `"after JPY BoJ"`                |
+| `"after Friday's NFP"`                | `"after USD NFP"`                |
+| `"after EU PMIs and US CPI"`          | pick one: `"after USD CPI"`      |
+| `"after the print on the 18th"`       | `"2026-05-18T23:50:00Z"` (ISO)   |
+
+If you're unsure whether ForexFactory will have the exact event titled this
+way, fall back to an explicit ISO timestamp instead — that's always safe.
+A silent fallback to "+2 days" is the worst outcome because the trade may
+move through its catalyst before the council reconvenes.
 
 **confidence_level**: A | B | C
 - A = high conviction; full Rhea-sized position
