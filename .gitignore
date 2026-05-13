@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Debate outputs — transcripts can be large and contain user-specific content
+debates/*
+!debates/.gitkeep
+
+# Paper-trader runtime state (ledger, alerts log, calendar cache)
+runtime/
+
+# Auto-generated trade plans (one YAML per debate)
+trade_plans/*
+!trade_plans/.gitkeep
+
+# Scheduler state
+schedule.sqlite
+*.sqlite
+*.sqlite-journal
+
+# Atomic-write tmp files
+*.tmp
+
+# Emergency kill switch (transient)
+KILL
+
+# Secrets
+.env
+.env.local
+*.key
+credentials.json
