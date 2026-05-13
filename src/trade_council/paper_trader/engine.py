@@ -73,6 +73,10 @@ class Cycle:
     position_snapshot: Position | None = None
     unrealized_pnl_usd: float | None = None
     notes: list[str] = field(default_factory=list)
+    # True when calendar.fetch() succeeded this cycle. False means event_gates
+    # are operationally blind — surfaced into the registry summary so the
+    # operator can see it without grepping logs.
+    calendar_ok: bool = True
 
 
 class Engine:
@@ -160,7 +164,8 @@ class Engine:
         try:
             events = self.calendar.fetch()
         except Exception as e:
-            cycle.notes.append(f"Calendar fetch failed: {e}")
+            cycle.notes.append(f"CALENDAR_DEAD: {type(e).__name__}: {e}")
+            cycle.calendar_ok = False
             events = []
         cycle.upcoming_events = [
             e for e in events

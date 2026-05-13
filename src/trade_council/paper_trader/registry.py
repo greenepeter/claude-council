@@ -249,4 +249,7 @@ def summarize_cycle(cycle: Any) -> str:
         p = cycle.position_snapshot
         pos = f"{p.direction} {p.symbol}@{p.entry_price:.5f} frac={p.open_fraction:.2f}"
     actions = ",".join(a.kind for a in cycle.actions) or "noop"
-    return f"spot={spot} state={state} pos={pos} actions={actions}"
+    # Surface calendar status so a dead feed (event_gates blind) is visible
+    # in `show_trades.py`'s last-summary column rather than buried in notes.
+    cal = "ok" if getattr(cycle, "calendar_ok", True) else "DEAD"
+    return f"spot={spot} state={state} pos={pos} actions={actions} cal={cal}"

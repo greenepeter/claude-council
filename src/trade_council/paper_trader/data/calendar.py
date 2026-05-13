@@ -1,16 +1,19 @@
-"""Economic calendar fetcher (ForexFactory free JSON mirror).
+"""Economic calendar fetcher — Finnhub-backed.
 
-The Faire Economy mirror is the standard free source mirroring ForexFactory's
-weekly calendar. Feed shape (one entry per event):
+Replaces the dead Fair Economy mirror. Uses Finnhub's /calendar/economic
+endpoint (free tier: 60 calls/min, requires API key in FINNHUB_API_KEY env).
+
+Finnhub event shape that we translate to CalendarEvent:
 
     {
-        "title":   "Consumer Price Index m/m",
-        "country": "USD",                   # currency code, not ISO country
-        "date":    "2026-05-13T08:30:00-04:00",
-        "impact":  "High",                  # "Low" | "Medium" | "High" | "Holiday"
-        "forecast": "0.2%",
-        "previous": "0.1%",
-        "actual":  ""                       # filled in after release
+        "actual": null,
+        "country": "US",                    # ISO country code; we map to currency
+        "estimate": null,
+        "event": "Initial Jobless Claims",  # used as title
+        "impact": "medium",                 # case-normalized
+        "prev": 250000,
+        "time": "2026-05-15 12:30:00",      # UTC; mapped to `when`
+        "unit": ""
     }
 
 The engine cares about two things per cycle:
@@ -26,20 +29,51 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 import json
+import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
-FOREXFACTORY_THIS_WEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-FOREXFACTORY_NEXT_WEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
-
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1/calendar/economic"
 USER_AGENT = "trade_council-paper-trader/0.1 (+https://localhost)"
+
+# Finnhub returns ISO country codes; our event_gates use currency codes.
+# Eurozone country codes all collapse to EUR (consistent with how the
+# moderator phrases gates: "EUR CPI" not "DE CPI"). For events specific
+# to one Eurozone country, callers should filter on event title rather
+# than the country code.
+ISO_COUNTRY_TO_CURRENCY = {
+    "US":  "USD", "USA": "USD",
+    "JP":  "JPY",
+    "GB":  "GBP", "UK":  "GBP",
+    "EU":  "EUR",
+    "DE":  "EUR", "FR":  "EUR", "IT":  "EUR", "ES":  "EUR", "NL": "EUR",
+    "BE":  "EUR", "AT":  "EUR", "IE":  "EUR", "PT":  "EUR", "GR": "EUR",
+    "FI":  "EUR", "LU":  "EUR", "SK":  "EUR", "EE":  "EUR", "LV": "EUR",
+    "LT":  "EUR", "SI":  "EUR", "CY":  "EUR", "MT":  "EUR",
+    "AU":  "AUD",
+    "NZ":  "NZD",
+    "CA":  "CAD",
+    "CH":  "CHF",
+    "CN":  "CNY", "CNH": "CNY",
+}
+
+# Finnhub impact values are lowercase; our internal convention is title-case
+# to match the legacy Fair-Economy feed's casing (and how plan event_gates
+# spell it: "High" / "Medium" / "Low").
+IMPACT_NORMALIZE = {
+    "low":     "Low",
+    "medium":  "Medium",
+    "high":    "High",
+    "holiday": "Holiday",
+}
 
 
 @dataclass
 class CalendarEvent:
     title: str
-    country: str                    # currency code per the feed
+    country: str                    # currency code (translated from Finnhub ISO country)
     when: datetime                  # tz-aware UTC
     impact: str                     # "Low" | "Medium" | "High" | "Holiday"
     forecast: str
@@ -55,33 +89,52 @@ class CalendarEvent:
 
 
 class CalendarSource:
-    """Fetches and caches the next ~2 weeks of high-impact macro events.
+    """Finnhub-backed calendar source.
 
-    The mirror's JSON is small (~50KB), so we re-fetch each cycle by default
-    and let an on-disk cache absorb transient network failures.
+    Same public API as the previous Fair-Economy implementation — only the
+    backing service changed:
+      * fetch() -> list[CalendarEvent]
+      * find_matching(events, title_contains, country=None, impact=None,
+                       within=None, now=None) -> list[CalendarEvent]
+
+    Free tier: 60 calls/min. With the default 4h cache TTL and a single-tick
+    hourly cron, we make at most 6 calls/day for the engine plus a handful
+    for resolver lookups — well within bounds.
+
+    Robustness:
+      * On HTTP/network failure during a fresh fetch, falls back to the cache
+        even if expired (rather than failing the whole cycle).
+      * Cache key is date-range-stamped so re-fetching the same window hits
+        the cache.
     """
 
-    def __init__(self, cache_dir: Path | None = None, cache_ttl_minutes: int = 30):
+    def __init__(self, cache_dir: Path | None = None, cache_ttl_minutes: int = 240):
         self.cache_dir = cache_dir
         self.cache_ttl = timedelta(minutes=cache_ttl_minutes)
+        self.api_key = os.environ.get("FINNHUB_API_KEY", "").strip()
 
     def fetch(self) -> list[CalendarEvent]:
-        events: list[CalendarEvent] = []
-        for url in (FOREXFACTORY_THIS_WEEK, FOREXFACTORY_NEXT_WEEK):
-            data = self._fetch_with_cache(url)
-            events.extend(self._parse(data))
-        # De-dupe on (title, when) — feeds occasionally double-list when
-        # the week boundary crosses an event.
-        seen: set[tuple[str, datetime]] = set()
-        unique: list[CalendarEvent] = []
-        for e in events:
-            key = (e.title, e.when)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(e)
-        unique.sort(key=lambda e: e.when)
-        return unique
+        if not self.api_key:
+            raise RuntimeError(
+                "FINNHUB_API_KEY not set in environment. "
+                "Sign up for a free key at https://finnhub.io and put it in .env."
+            )
+
+        # 21-day window so the 14-day resolver lookup always has headroom for
+        # event-form next_review values (e.g., "after USD CPI" 18 days out).
+        now = datetime.now(timezone.utc)
+        params = {
+            "token": self.api_key,
+            "from":  now.strftime("%Y-%m-%d"),
+            "to":    (now + timedelta(days=21)).strftime("%Y-%m-%d"),
+        }
+        url = f"{FINNHUB_BASE_URL}?{urllib.parse.urlencode(params)}"
+
+        # Cache key is range-stamped, NOT token-stamped (no secrets on disk).
+        cache_key = f"finnhub_{params['from']}_to_{params['to']}.json"
+
+        data = self._fetch_with_cache(url, cache_key)
+        return self._parse(data)
 
     def find_matching(
         self,
@@ -92,14 +145,10 @@ class CalendarSource:
         within: timedelta | None = None,
         now: datetime | None = None,
     ) -> list[CalendarEvent]:
-        """Filter events by substring/country/impact, optionally limited to a window.
-
-        Substring match is case-insensitive on the title. `within` filters to
-        events whose scheduled time is within `now ± within`.
-        """
+        """Substring + country + impact filter; optional time-distance window."""
         now = now or datetime.now(timezone.utc)
         needle = title_contains.lower()
-        out = []
+        out: list[CalendarEvent] = []
         for e in events:
             if needle not in e.title.lower():
                 continue
@@ -115,16 +164,14 @@ class CalendarSource:
 
     # ── internals ──────────────────────────────────────────────────────────
 
-    def _cache_path(self, url: str) -> Path | None:
+    def _cache_path(self, key: str) -> Path | None:
         if self.cache_dir is None:
             return None
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        # one cache file per source URL
-        safe = url.rsplit("/", 1)[-1]
-        return self.cache_dir / f"calendar_{safe}"
+        return self.cache_dir / key
 
-    def _fetch_with_cache(self, url: str) -> bytes:
-        cache = self._cache_path(url)
+    def _fetch_with_cache(self, url: str, cache_key: str) -> bytes:
+        cache = self._cache_path(cache_key)
         if cache is not None and cache.exists():
             age = datetime.now(timezone.utc).timestamp() - cache.stat().st_mtime
             if age < self.cache_ttl.total_seconds():
@@ -135,8 +182,12 @@ class CalendarSource:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 payload = resp.read()
         except (urllib.error.URLError, TimeoutError) as e:
+            # Stale-cache fallback: if a fresh fetch fails (including HTTP
+            # 4xx/5xx from urllib.error.HTTPError, which is a URLError
+            # subclass), return whatever cache we have even if expired.
+            # Better stale data than no data — keeps event_gates working
+            # through transient API issues.
             if cache is not None and cache.exists():
-                # Fall back to stale cache rather than crashing the cycle
                 return cache.read_bytes()
             raise RuntimeError(f"Calendar fetch failed and no cache available: {e}") from e
 
@@ -150,34 +201,62 @@ class CalendarSource:
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             raise RuntimeError(f"Calendar payload was not valid JSON: {e}") from e
 
-        events = []
-        for entry in raw:
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"Calendar payload unexpected shape: {type(raw).__name__}")
+
+        raw_events = raw.get("economicCalendar") or []
+        events: list[CalendarEvent] = []
+        for entry in raw_events:
+            if not isinstance(entry, dict):
+                continue
             try:
-                when = self._parse_when(entry.get("date", ""))
+                when = self._parse_when(entry.get("time", ""))
             except ValueError:
                 continue
-            events.append(
-                CalendarEvent(
-                    title=str(entry.get("title", "")),
-                    country=str(entry.get("country", "")),
-                    when=when,
-                    impact=str(entry.get("impact", "")),
-                    forecast=str(entry.get("forecast", "")),
-                    previous=str(entry.get("previous", "")),
-                    actual=str(entry.get("actual", "")),
-                )
-            )
+
+            iso_country = str(entry.get("country") or "").upper().strip()
+            currency = ISO_COUNTRY_TO_CURRENCY.get(iso_country, iso_country)
+
+            impact_raw = str(entry.get("impact") or "").lower().strip()
+            impact = IMPACT_NORMALIZE.get(impact_raw, impact_raw.title() or "Low")
+
+            events.append(CalendarEvent(
+                title=str(entry.get("event") or "").strip(),
+                country=currency,
+                when=when,
+                impact=impact,
+                forecast=_str_or_empty(entry.get("estimate")),
+                previous=_str_or_empty(entry.get("prev")),
+                actual=_str_or_empty(entry.get("actual")),
+            ))
+        events.sort(key=lambda e: e.when)
         return events
 
     @staticmethod
-    def _parse_when(s: str) -> datetime:
-        # The feed uses ISO-8601 with offset (e.g. "2026-05-13T08:30:00-04:00").
-        # Python's fromisoformat handles this from 3.11+; for 3.10 we strip "Z".
+    def _parse_when(s: Any) -> datetime:
+        """Finnhub returns UTC time as 'YYYY-MM-DD HH:MM:SS' (no tz suffix).
+
+        Accept a few common variants defensively.
+        """
+        s = (str(s) if s is not None else "").strip()
         if not s:
-            raise ValueError("empty date")
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+            raise ValueError("empty time field")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        # Last resort: try ISO with Z suffix
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"could not parse time {s!r}")
+
+
+def _str_or_empty(v: Any) -> str:
+    """Finnhub uses None freely for missing fields. Coerce to empty string
+    so downstream string ops don't choke."""
+    if v is None:
+        return ""
+    return str(v).strip()
