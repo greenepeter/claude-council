@@ -291,10 +291,43 @@ def resolve_next_review(value: str, calendar_source=None, now: datetime | None =
 
 
 def _next_event_match(query: str, calendar_source, now: datetime) -> datetime | None:
-    """Find the next event on the calendar that matches the query string."""
-    # Parse query - look for currency code and event keyword.
-    # E.g., "USD CPI", "FOMC", "GBP Employment".
+    """Find the next event on the calendar that matches the query string.
+
+    Accepts either currency-code phrasing ("USD CPI", "JPY GDP") or country-name
+    phrasing ("US CPI", "Japan GDP"). Country names are translated to currency
+    codes before the calendar lookup.
+    """
     q = query.upper()
+
+    # First, translate country names to currency codes so downstream code only
+    # has to deal with the 3-letter form. Longer keys first to avoid partial
+    # matches (e.g. "NEW ZEALAND" before "ZEALAND").
+    country_to_ccy = [
+        ("NEW ZEALAND", "NZD"),
+        ("AUSTRALIAN",  "AUD"),
+        ("AUSTRALIA",   "AUD"),
+        ("CANADIAN",    "CAD"),
+        ("CANADA",      "CAD"),
+        ("SWITZERLAND", "CHF"),
+        ("SWISS",       "CHF"),
+        ("JAPANESE",    "JPY"),
+        ("JAPAN",       "JPY"),
+        ("BRITISH",     "GBP"),
+        ("BRITAIN",     "GBP"),
+        ("ENGLISH",     "GBP"),
+        ("UK",          "GBP"),
+        ("EUROZONE",    "EUR"),
+        ("EUROPEAN",    "EUR"),
+        ("EUROPE",      "EUR"),
+        ("AMERICAN",    "USD"),
+        ("USA",         "USD"),
+        ("US",          "USD"),
+    ]
+    for name, ccy in country_to_ccy:
+        if name in q:
+            q = q.replace(name, ccy)
+            break
+
     currency = None
     for ccy in ("USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"):
         if ccy in q:

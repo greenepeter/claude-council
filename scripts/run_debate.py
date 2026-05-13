@@ -104,6 +104,10 @@ def _build_argparser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--topic", help="The topic/question to debate.")
+    p.add_argument("--symbol", default=None,
+                   help="Instrument symbol (e.g. EURUSD, GBPJPY). Required for auto-scheduling "
+                        "the follow-up debate; if omitted, follow-up scheduling is skipped and "
+                        "must be done manually via scripts/seed_debate.py.")
     p.add_argument("--decisions", help="Comma-separated list of decision IDs the moderator must resolve.")
     p.add_argument("--specialists", default="all",
                    help="Comma-separated specialist names (filenames without .md), or 'all'. Default: all.")
@@ -211,7 +215,80 @@ def main():
     if transcript.end_summary:
         print(f"\nModerator summary: {transcript.end_summary}")
 
+    # Auto-schedule the follow-up debate so the autonomous loop picks it up.
+    # Mirrors what run_autonomous.py::process_one() does after each debate it
+    # processes. Without this, a manual `run_debate.py` invocation creates a
+    # dangling plan with no scheduled reconvene.
+    if not args.symbol:
+        print()
+        print("[scheduler] --symbol not provided; follow-up debate NOT auto-scheduled.")
+        print("[scheduler] Seed it manually via scripts/seed_debate.py if you want autonomy.")
+    else:
+        _schedule_follow_up(
+            symbol=args.symbol,
+            transcript=transcript,
+            decisions=decisions,
+            specialists=specialists,
+            moderator=args.moderator,
+        )
+
     return 0
+
+
+def _schedule_follow_up(symbol, transcript, decisions, specialists, moderator):
+    """Pull next_review from the transcript, resolve it, and add to schedule.
+
+    Best-effort: prints diagnostics and continues on any failure rather than
+    raising — a debate that completed successfully shouldn't fail at the end
+    just because the follow-up couldn't be scheduled.
+    """
+    try:
+        from trade_council.scheduler import Scheduler, resolve_next_review
+        from trade_council.builtin_decisions import NEXT_REVIEW
+    except Exception as e:
+        print(f"\n[scheduler] could not import scheduler: {type(e).__name__}: {e}")
+        return
+
+    next_review_value = ""
+    rationale = ""
+    for d in transcript.decisions_recorded:
+        if d.decision_id == NEXT_REVIEW:
+            next_review_value = d.value or ""
+            rationale = d.rationale or ""
+            break
+
+    if not next_review_value:
+        print("\n[scheduler] no next_review decision found in transcript; defaulting to 'in 2 days'")
+        next_review_value = "in 2 days"
+
+    # Best-effort calendar source for event-based resolution.
+    cal = None
+    try:
+        from trade_council.paper_trader.data.calendar import CalendarSource
+        cal = CalendarSource()
+    except Exception as e:
+        print(f"[scheduler] calendar source unavailable ({e}); event phrases will fall back to +2 days")
+
+    next_iso = resolve_next_review(next_review_value, calendar_source=cal)
+
+    try:
+        db_path = PROJECT_ROOT / "schedule.sqlite"
+        sched = Scheduler(db_path)
+        follow_id = sched.add_debate(
+            symbol=symbol,
+            topic=f"{symbol.upper()} follow-up: {next_review_value}",
+            decisions=decisions,
+            specialists=specialists if specialists else "all",
+            moderator=moderator,
+            next_review_at=next_iso,
+            reconvene_reason=rationale or next_review_value,
+        )
+        sched.close()
+        print(f"\nNext debate auto-scheduled: id={follow_id} symbol={symbol.upper()} "
+              f"at {next_iso} (reason: {next_review_value!r})")
+    except Exception as e:
+        print(f"\n[scheduler] add_debate failed: {type(e).__name__}: {e}")
+        print("[scheduler] Seed manually via scripts/seed_debate.py to recover.")
 
 
 if __name__ == "__main__":
