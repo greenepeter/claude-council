@@ -336,24 +336,24 @@ def _next_event_match(query: str, calendar_source, now: datetime) -> datetime | 
     # The keyword is the rest after stripping the currency
     keyword = q.replace(currency or "", "").strip() or q
 
-    # Try to fetch events for the next 14 days
-    events = calendar_source.events_between(
-        now, now + timedelta(days=14)
-    ) if hasattr(calendar_source, "events_between") else []
+    # Fetch the full event window from the calendar source. CalendarSource
+    # exposes fetch() which returns ~2 weeks of high-impact CalendarEvent
+    # dataclasses (NOT dicts) — earlier code that called .events_between()
+    # and .get("title") was broken; this is the working API.
+    try:
+        events = calendar_source.fetch()
+    except Exception as e:
+        print(f"[scheduler] calendar fetch failed: {type(e).__name__}: {e}")
+        return None
 
-    for ev in events:
-        ev_title = (ev.get("title") or "").upper()
-        ev_country = (ev.get("country") or "").upper()
-        if currency and ev_country != currency:
+    horizon = now + timedelta(days=14)
+    # Sort by .when so the first match returned is the soonest qualifying event.
+    for ev in sorted(events, key=lambda e: e.when):
+        if ev.when < now or ev.when > horizon:
             continue
-        if keyword and keyword not in ev_title:
+        if currency and ev.country.upper() != currency:
             continue
-        ev_when = ev.get("when")
-        if isinstance(ev_when, str):
-            try:
-                return datetime.fromisoformat(ev_when.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-        if isinstance(ev_when, datetime):
-            return ev_when
+        if keyword and keyword not in ev.title.upper():
+            continue
+        return ev.when
     return None
